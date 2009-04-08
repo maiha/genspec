@@ -1,0 +1,23 @@
+genspec
+=======
+
+A Rails utils that automatically generates a rspec file for the latest action written in a log file 
+
+
+Example
+=======
+
+  % ruby genspec log/development.rb
+
+
+Experimental
+============
+
+  % ruby genspec -e log/development.rb
+
+  This will call "psql" and execute queries!
+  It's too dangerous!!
+  I don't know what happens :)
+  
+
+Copyright (c) 2008 maiha@wota.jp, released under the MIT license

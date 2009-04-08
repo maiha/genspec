@@ -1,0 +1,268 @@
+#!/usr/bin/env ruby -Ku
+
+require 'pathname'
+require 'set'
+require 'erb'
+require 'yaml'
+
+class TableQuery
+  class CannotMerge < RuntimeError; end
+
+  class Body
+    def initialize(string)
+      @string = string.to_s.strip
+      compaction!
+    end
+
+    def compaction!
+      # WHERE ("id" = 56) LIMIT 1
+      case @string
+      when /\A(WHERE \(.*\)\s)+LIMIT\s+1\Z/
+        @string = $1.strip
+      end
+    end
+
+    def where?
+      /\AWHERE\s+/ === @string
+    end
+
+    def conds
+      # WHERE (order_id = 300312052 and delivery_unit_id = 300312052 and slot_time = '2009-04-08 00:00:00.000000')
+      if /\AWHERE\s+/ === @string
+        cond = $'.to_s
+        # => "(order_id = 300312052 and delivery_unit_id = 300312052 and slot_time = '2009-04-08 00:00:00.000000')"
+
+        cond = strip_parens(cond)
+        # => "order_id = 300312052 and delivery_unit_id = 300312052 and slot_time = '2009-04-08 00:00:00.000000'"
+
+        array = cond.split(/\s+(?:and)\s+/)
+        # => ["order_id = 300312052", "delivery_unit_id = 300312052", "slot_time = '2009-04-08 00:00:00.000000'"]
+
+        hash = {}
+        array.each do |cond|
+          # => "order_id = 300312052"
+          key, op, value = cond.split(/\s+/, 3)
+          key = key.to_s.delete('"')
+
+          hash[key] ||= []
+          case op
+          when "="
+            hash[key] << value
+          when "IN"
+            vals = strip_parens(value).split(/,/)
+            hash[key] += vals
+          else
+            raise CannotMerge, "unknown op:[#{op}] while parsing:[#{@string}]"
+          end
+        end
+        return hash
+
+      else
+        nil
+      end
+    end
+
+    def to_s
+      @string
+    end
+
+    private
+      def strip_parens(str)
+        /\A\s*\((.+)\)\s*\Z/ === str ? $1 : str
+      end
+  end
+
+  attr_reader :table
+
+  def initialize(table)
+    @table = table
+    @bodies = Set.new
+  end
+
+  def <<(query)
+    @bodies << Body.new(query)
+  end
+
+  def merge
+    # WHERE ("id" = 22826)
+    # WHERE ("id" IN (22825,22826,22388))
+
+    # only WHERE is supported in this version
+    hash = {}
+    @bodies.each do |body|
+      if body.where?
+        conds = body.conds
+        conds.each do |key, vals|
+          hash[key] ||= []
+          hash[key] += vals.to_a
+        end
+      else
+        raise CannotMerge, "only WHERE is supported: #{@bodies.inspect}"
+      end
+    end
+    hash
+  end
+
+  def to_sql
+    to_merged_sql
+  rescue CannotMerge => e
+    $stderr.puts "skip: #{e}"
+    to_raw_sql
+  end
+
+  def to_merged_sql
+    sql   = "SELECT * FROM #{@table}"
+    conds = merge
+    unless conds.empty?
+      sql << " WHERE "
+      sql << conds.map do |(key, vals)|
+        case vals.size
+        when 1
+          "%s = %s" % [key, vals.join]
+        else
+          "%s IN (%s)" % [key, vals.sort.uniq.join(',')]
+        end
+      end.join(" and ")
+    end
+    return sql
+  end
+
+  def to_raw_sql
+    @bodies.map do |body|
+      "SELECT * FROM %s %s" % [@table, body.to_s]
+    end.join("\n")
+  end
+
+  def to_s
+    padding = ' ' * 4
+    array = ["#{@table}"]
+    array += @bodies.map{|i| padding+i.to_s}
+    array.join("\n")
+  end
+end
+
+class LogParser
+  def initialize(buffer, options = {})
+    @buffer  = buffer.to_s
+    @options = options
+    @queries = {}
+
+    # remove escape color sequences
+    @buffer.gsub!(/\e\[(3[0-7]|0|)m/, '')
+
+    # fetch last action
+    @buffer = "Processing " + @buffer.split(/(\A|\n\n)Processing /).last.to_s
+  end
+
+  def execute
+    parse
+    print
+  end
+
+  private
+    def parse
+      parse_actions
+      parse_select_query
+    end
+
+    def parse_actions
+      # Processing ItemController#index (for 192.168.1.30 at 2009-04-08 17:29:47) [GET]
+      if /^Processing (.*?)#(.*?) \(/m === @buffer
+        @controller = $1
+        @action     = $2
+      end
+    end
+
+    def parse_select_query
+      # Job Load (0.016645) (0 Rows)   SELECT * FROM "jobs" WHERE (state='finished' and updated_at < '2008-04-08 17:39:02.122850')
+      @selects = @buffer.scan(/SELECT .*?FROM (.*?)$/m).flatten
+      @selects.reject!{|sql| sql.include?(" INNER JOIN ")}
+      @selects.uniq!
+
+      @selects.each do |sql|
+        table, body = sql.split(/\s+/,2)
+        body.gsub!(/#{table}\./, '')
+        table.delete!('"')
+        query = @queries[table] ||= TableQuery.new(table)
+        query << body
+      end
+    end
+
+    def print
+      puts to_rspec
+    end
+
+    def each_query(&block)
+      @queries.keys.sort.map do |table|
+        query = @queries[table]
+        block.call(query)
+      end.join("\n")
+    end
+
+    def query_info(query)
+      sql = query.to_sql
+      sql = "-- " + sql unless sql.include?(" WHERE ")
+      sql + ";"
+    end
+
+    def query_execute(query)
+      if @options[:execute_query]
+        database = YAML.load(File.read("config/database.yml"))["development"]["database"]
+        execute_sql(query.to_sql, database)
+      else
+        nil
+      end
+    end
+
+    def execute_sql(sql, database)
+      sql.include?('"') and
+        raise NotImplementedError, "error: query contains double quotes"
+      database.to_s.empty? and
+        raise NotImplementedError, "error: cannot guess database"
+      `psql -c "#{sql};" #{database}`
+    end
+
+    def to_rspec
+      erb = ERB.new(DATA.read)
+      erb.result(binding)
+    end
+end
+
+options = {
+  :execute_query => ARGV.delete('-e'),
+}
+
+src = ARGV.shift or raise "usage: #{$0} log_file (out_file)"
+dst = ARGV.shift
+
+buffer = Pathname(src).read
+parser = LogParser.new(buffer, options)
+parser.execute
+
+__END__
+require File.join(File.dirname(__FILE__), '../spec_helper.rb')
+
+describe <%= @controller %> do
+  ######################################################################
+  ### <%= @controller %>#<%= @action %>
+  ######################################################################
+
+  it "should provide #<%= @action %>" do
+    <%= @controller %>.new.should respond_to(:<%= @action %>)
+  end
+
+  describe "#<%= @action %>" do
+<% unless @queries.empty? %>
+    ###################################################################
+    ### Fixtures
+<%   each_query do |query| %>
+    table_fixture :<%= query.table %>, <<-SQL
+<%= query_info(query) %>
+<%= query_execute(query) %>
+SQL
+<%   end %>
+<% end %>
+    it "should ..." do
+    end
+  end
+end
