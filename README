@@ -18,6 +18,15 @@ Experimental
   This will call "psql" and execute queries!
   It's too dangerous!!
   I don't know what happens :)
+
+
+Rubygenspec
+===========
+
+  Use rubygenspec for general ruby code
+
+  % ruby rubygenspec foo.rb
+
   
 
 Copyright (c) 2008 maiha@wota.jp, released under the MIT license

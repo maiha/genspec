@@ -1,0 +1,187 @@
+#!/usr/bin/env ruby -Ku
+
+require 'pathname'
+require 'erb'
+require 'rubygems'
+require 'extlib'
+require 'extlib/dictionary'
+
+######################################################################
+### For ParseTree
+
+require 'parse_tree'
+require 'sexp'
+require 'sexp_processor'
+require 'unified_ruby'
+
+class Unifier
+  include UnifiedRuby
+end
+
+class Sexp
+  def each_of_types(*types, &b)
+    each do | elem |
+      if Sexp === elem then
+        elem.each_of_types(*types, &b)
+        b.call(elem.first, elem) if types.include?(elem.first)
+      end
+    end
+  end
+
+  def each_method(&block)
+    scope = :public
+    each_of_types(:call, :defn) do |t, s|
+      case t
+      when :call
+        # s(:call, nil, :private, s(:arglist))
+        case s[2]
+        when :public, :protected, :private
+          scope = s[2]
+        end
+      when :defn
+        # s(:defn, :records, s(:args), s(:scope, s(:block, s(:op_asgn1, s(:ivar, :@cache), s(:arglist, s(:lit, :records)), :"||", ...
+        name = s[1]
+
+        # args
+        unless s[2].is_a?(Sexp) and s[2].first == :args
+          raise "ERROR: expected Sexp(:args), but got: %s" % s[2].inspect
+        end
+        args = s[2][1..-1].map(&:to_s) rescue ["[ERROR] cannot create args from: #{s.inspect}"]
+        case block.arity
+        when 1
+          block.call(name)
+        when 2
+          block.call(name, args)
+        when 3
+          block.call(scope, name, args)
+        else
+          block.call(scope, name, args, s)
+        end
+      else
+        raise "ERROR: Bug of Sexp#each_of_types; unknown symbol comes: #{t.class.name}"
+      end
+    end
+  end
+end
+
+
+class RubyFileParser
+  RubyClass = Struct.new(:name, :methods)
+  class RubyClass
+    def var
+      val = Extlib::Inflection.underscore(Extlib::Inflection.demodulize(name))
+      if val.size < 12
+        val
+      else
+        ("_"+val).scan(/_(.)/).flatten.join
+      end
+    end
+
+    def methods
+      @methods ||= Dictionary.new
+    end
+
+    def sample_code_for_new
+      method = methods[:initialize]
+      if method
+        "new(%s)" % method.args.map(&:inspect).join(', ')
+      else
+        "new"
+      end
+    end
+  end
+
+  DefinedMethod = Struct.new(:scope, :name, :args)
+  class DefinedMethod
+    def public?
+      scope == :public
+    end
+  end
+
+  attr_reader :classes
+
+  def initialize(path, options = {})
+    @path = Pathname(path)
+    @sexp = construct_sexp
+    @options = options
+
+    @classes = []
+  end
+
+  def execute
+    parse
+    print
+  end
+
+  private
+    def current_class
+      if @classes.last.is_a?(RubyClass)
+        @classes.last
+      else
+        # create an anonymous class (maybe toplevel)
+        @classes << RubyClass.new
+      end
+    end
+
+    def switch_to_class(name)
+      @classes.find{|k| k.name == name} or
+        @classes << RubyClass.new(name)
+    end
+
+    def construct_sexp
+      code = @path.read
+      sexp = ParseTree.new(false).parse_tree_for_string(code, @path).first
+      sexp = Unifier.new.process(sexp)
+      return sexp
+    end
+
+    def parse
+      @sexp.each_of_type(:class) do |type, klass, np, sexp|
+        #  s(:class,
+        #   :CreativeCount,
+        #   nil,
+        #   s(:scope,
+        switch_to_class(klass)
+        sexp.each_method do |scope, name, args|
+          method = DefinedMethod.new(scope, name, args)
+          current_class.methods[name] ||= method
+        end
+      end
+    end
+
+    def print
+      puts to_rspec
+    end
+
+    def to_rspec
+      head  = "require File.join(File.dirname(__FILE__), '../spec_helper.rb')\n\n"
+      specs = @classes.map do |klass|
+        erb = ERB.new(DATA.read)
+        erb.result(binding)
+      end
+
+      head + specs.join("\n\n")
+    end
+end
+
+src = ARGV.shift or raise "usage: #{$0} source_file"
+parser = RubyFileParser.new(src)
+parser.execute
+
+__END__
+######################################################################
+### <%= klass.name %>
+describe <%= klass.name %> do
+  before do
+    @<%= klass.var %> = <%= klass.name %>.<%= klass.sample_code_for_new %>
+  end
+<% klass.methods.values.select(&:public?).each do |method| next if method.name == :initialize %>
+  it "should provide #<%= method.name %>" do
+    @<%= klass.var %>.should respond_to(:<%= method.name %>)
+  end
+
+  describe "#<%= method.name %>" do
+    it "should ..."
+  end
+<% end %>
+end
